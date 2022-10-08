@@ -1331,8 +1331,8 @@ void appendOneRow(SSDataBlock* pBlock, TSKEY* pStartTs, TSKEY* pEndTs, uint64_t*
   colDataAppend(pEndTsCol, pBlock->info.rows, (const char*)pEndTs, false);
   colDataAppend(pUidCol, pBlock->info.rows, (const char*)pUid, false);
   colDataAppend(pGpCol, pBlock->info.rows, (const char*)pGp, false);
-  colDataAppendNULL(pCalStartCol, pBlock->info.rows);
-  colDataAppendNULL(pCalEndCol, pBlock->info.rows);
+  colDataAppend(pCalStartCol, pBlock->info.rows, (const char*)pStartTs, false);
+  colDataAppend(pCalEndCol, pBlock->info.rows, (const char*)pEndTs, false);
   pBlock->info.rows++;
 }
 
@@ -1430,7 +1430,6 @@ static int32_t setBlockIntoRes(SStreamScanInfo* pInfo, const SSDataBlock* pBlock
     }
   }
 
-  doFilter(pInfo->pCondition, pInfo->pRes, NULL);
   blockDataUpdateTsWindow(pInfo->pRes, pInfo->primaryTsIndex);
   blockDataFreeRes((SSDataBlock*)pBlock);
   return 0;
@@ -1771,6 +1770,7 @@ FETCH_NEXT_BLOCK:
           // printDataBlock(pSDB, "stream scan update");
           return pSDB;
         }
+        blockDataCleanup(pInfo->pUpdateDataRes);
         pInfo->scanMode = STREAM_SCAN_FROM_READERHANDLE;
       } break;
       default:
@@ -1830,11 +1830,30 @@ FETCH_NEXT_BLOCK:
           continue;
         }
 
-        if (pBlockInfo->rows > 0) {
+        if (pInfo->pUpdateInfo) {
+          checkUpdateData(pInfo, true, pInfo->pRes, true);
+          pInfo->twAggSup.maxTs = TMAX(pInfo->twAggSup.maxTs, pBlockInfo->window.ekey);
+          if (pInfo->pUpdateDataRes->info.rows > 0) {
+            pInfo->updateResIndex = 0;
+            if (pInfo->pUpdateDataRes->info.type == STREAM_CLEAR) {
+              pInfo->scanMode = STREAM_SCAN_FROM_UPDATERES;
+            } else if (pInfo->pUpdateDataRes->info.type == STREAM_INVERT) {
+              pInfo->scanMode = STREAM_SCAN_FROM_RES;
+              return pInfo->pUpdateDataRes;
+            } else if (pInfo->pUpdateDataRes->info.type == STREAM_DELETE_DATA) {
+              pInfo->scanMode = STREAM_SCAN_FROM_DELETE_DATA;
+            }
+          }
+        }
+
+        doFilter(pInfo->pCondition, pInfo->pRes, NULL);
+        blockDataUpdateTsWindow(pInfo->pRes, pInfo->primaryTsIndex);
+
+        if (pBlockInfo->rows > 0 || pInfo->pUpdateDataRes->info.rows > 0) {
           break;
         }
       }
-      if (pBlockInfo->rows > 0) {
+      if (pBlockInfo->rows > 0 || pInfo->pUpdateDataRes->info.rows > 0) {
         break;
       } else {
         pInfo->tqReader->pMsg = NULL;
@@ -1848,32 +1867,16 @@ FETCH_NEXT_BLOCK:
     pOperator->resultInfo.totalRows += pBlockInfo->rows;
     // printDataBlock(pInfo->pRes, "stream scan");
 
-    if (pBlockInfo->rows == 0) {
-      updateInfoDestoryColseWinSBF(pInfo->pUpdateInfo);
-      /*pOperator->status = OP_EXEC_DONE;*/
-    } else if (pInfo->pUpdateInfo) {
-      checkUpdateData(pInfo, true, pInfo->pRes, true);
-      pInfo->twAggSup.maxTs = TMAX(pInfo->twAggSup.maxTs, pBlockInfo->window.ekey);
-      if (pInfo->pUpdateDataRes->info.rows > 0) {
-        pInfo->updateResIndex = 0;
-        if (pInfo->pUpdateDataRes->info.type == STREAM_CLEAR) {
-          pInfo->scanMode = STREAM_SCAN_FROM_UPDATERES;
-        } else if (pInfo->pUpdateDataRes->info.type == STREAM_INVERT) {
-          pInfo->scanMode = STREAM_SCAN_FROM_RES;
-          return pInfo->pUpdateDataRes;
-        } else if (pInfo->pUpdateDataRes->info.type == STREAM_DELETE_DATA) {
-          pInfo->scanMode = STREAM_SCAN_FROM_DELETE_DATA;
-        }
-      }
-    }
-
     qDebug("scan rows: %d", pBlockInfo->rows);
     if (pBlockInfo->rows > 0) {
       return pInfo->pRes;
-    } else {
-      goto NEXT_SUBMIT_BLK;
     }
-    /*return (pBlockInfo->rows == 0) ? NULL : pInfo->pRes;*/
+
+    if (pInfo->pUpdateDataRes->info.rows > 0) {
+      goto FETCH_NEXT_BLOCK;
+    }
+
+    goto NEXT_SUBMIT_BLK;
   } else {
     ASSERT(0);
     return NULL;
